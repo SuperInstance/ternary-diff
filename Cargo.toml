@@ -5,6 +5,6 @@ edition = "2021"
 license = "MIT"
 description = "Diff and patch for ternary strategies: compare, merge, conflict resolution, three-way diff"
 keywords = ["diff", "ternary", "merge", "patch", "strategy"]
-categories = ["algorithms", "data-structures", "text-editing"]
+categories = ["algorithms", "data-structures"]
 
 [dependencies]
