@@ -18,7 +18,7 @@ ternary-lattice's `TernaryLattice::join()` provides a deterministic conflict res
 In room-as-codespace, PLATO synchronizes tile stores between rooms. Instead of sending entire tile stores, rooms exchange ternary-diffs — compact summaries of what changed. When two rooms modify the same tile concurrently, `ThreeWayMerge` detects the conflict and `ConflictResolver` resolves it using domain-specific rules (e.g., the room with higher surprise wins). This is git-style distributed synchronization for room state.
 
 ## Cross-Pollination Ideas
-- **ternary-steganography**: Hide data in diffs — the `ConflictResolver::Custom` variant can encode hidden information in its resolution choices, creating a covert channel in the diff stream.
+- **ternary-steganography**: Hide data in diffs — a custom conflict-resolution callback (wired into `ConflictResolver` via a future per-conflict API) could encode hidden information in its resolution choices, creating a covert channel in the diff stream.
 - **ternary-codes**: Error-correcting diffs — encode diffs with ternary-codes' Hamming protection before transmission, so corrupted patches can be corrected.
 - **ternary-causality**: Causal diffs — annotate diff hunks with causal labels so the consumer knows which changes are causes vs. effects.
 

@@ -1,23 +1,55 @@
 //! # ternary-diff
 //!
-//! Diff and patch for ternary strategies: compare, merge, and resolve conflicts.
+//! Diff, patch, and three-way merge for sequences of ternary values
+//! (`{-1, 0, +1}`).
 //!
-//! Provides:
-//! - `Trit` — Core ternary value
-//! - `TernaryDiff` — Diff computation between ternary sequences
-//! - `TernaryPatch` — Apply patches to sequences
-//! - `ThreeWayMerge` — Three-way merge with conflict detection
-//! - `ConflictResolver` — Strategies for resolving merge conflicts
+//! ## When to use this
+//!
+//! Use `ternary-diff` when your data is naturally a sequence of ternary values
+//! — sensor streams, voting tallies, cell/automata states, ternary feature
+//! flags — and you need to **compare** two versions, **transform** one into the
+//! other, or **merge** two divergent edits against a common base. It is, in
+//! effect, `git diff` / `git merge` for ternary data rather than text lines.
+//!
+//! What it provides:
+//! - [`Trit`] — the core ternary value (Neg, Zero, Pos).
+//! - [`TernarySeq`] — an ordered, mutable sequence of trits.
+//! - [`TernaryDiff`] — an LCS-based diff between two sequences.
+//! - [`TernaryPatch`] — apply a diff to a sequence (reconstructing the target)
+//!   and reverse diffs.
+//! - [`ThreeWayMerge`] — position-wise three-way merge with conflict detection.
+//! - [`ConflictResolver`] — strategies for resolving merge conflicts.
+//!
+//! ## Round-trip guarantee
+//!
+//! For any two sequences `a` and `b`, applying the diff to `a` reproduces `b`
+//! exactly, and applying the reversed diff to `b` reproduces `a` exactly:
+//!
+//! ```ignore
+//! let d = TernaryDiff::diff(&a, &b);
+//! assert_eq!(TernaryPatch::apply(&a, &d).trits(), b.trits());
+//! assert_eq!(TernaryPatch::apply(&b, &TernaryPatch::reverse(&d)).trits(), a.trits());
+//! ```
 
-/// Ternary value
+// Encourage (but do not hard-deny) documentation of the entire public API.
+#![warn(missing_docs)]
+
+/// A single ternary value: one of negative, zero, or positive.
+///
+/// Maps to the integers `-1`, `0`, and `+1` via [`Trit::to_i8`] /
+/// [`Trit::from_i8`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Trit {
+    /// The negative value (`-1`).
     Neg,
+    /// The zero / neutral value (`0`).
     Zero,
+    /// The positive value (`+1`).
     Pos,
 }
 
 impl Trit {
+    /// Convert this trit to its `i8` representation (`-1`, `0`, or `1`).
     pub fn to_i8(self) -> i8 {
         match self {
             Trit::Neg => -1,
@@ -26,6 +58,8 @@ impl Trit {
         }
     }
 
+    /// Parse an `i8` into a trit. Returns `None` for any value other than
+    /// `-1`, `0`, or `1`.
     pub fn from_i8(v: i8) -> Option<Self> {
         match v {
             -1 => Some(Trit::Neg),
@@ -36,53 +70,91 @@ impl Trit {
     }
 }
 
-/// A sequence of ternary values
+/// An ordered, mutable sequence of [`Trit`] values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TernarySeq {
     trits: Vec<Trit>,
 }
 
 impl TernarySeq {
+    /// Create a sequence that owns the given trits.
     pub fn new(trits: Vec<Trit>) -> Self {
         TernarySeq { trits }
     }
 
+    /// Build a sequence from a slice of `i8`, **silently dropping** any value
+    /// that is not `-1`, `0`, or `1`.
+    ///
+    /// This is forgiving but can hide data-entry mistakes. If you need to
+    /// detect rejected values, use [`TernarySeq::from_i8_strict`].
     pub fn from_i8(values: &[i8]) -> Self {
         TernarySeq {
             trits: values.iter().filter_map(|&v| Trit::from_i8(v)).collect(),
         }
     }
 
+    /// Build a sequence from a slice of `i8`, returning an error holding the
+    /// first value that is not `-1`, `0`, or `1` instead of silently dropping
+    /// it.
+    ///
+    /// ```
+    /// # use ternary_diff::{TernarySeq, Trit};
+    /// assert!(TernarySeq::from_i8_strict(&[-1, 0, 1]).is_ok());
+    /// assert_eq!(TernarySeq::from_i8_strict(&[1, 2, 3]), Err(2));
+    /// ```
+    pub fn from_i8_strict(values: &[i8]) -> Result<Self, i8> {
+        let mut trits = Vec::with_capacity(values.len());
+        for &v in values {
+            match Trit::from_i8(v) {
+                Some(t) => trits.push(t),
+                // Surface the offending value instead of silently dropping it.
+                None => return Err(v),
+            }
+        }
+        Ok(TernarySeq::new(trits))
+    }
+
+    /// Number of trits in the sequence.
     pub fn len(&self) -> usize {
         self.trits.len()
     }
 
+    /// Whether the sequence contains no trits.
     pub fn is_empty(&self) -> bool {
         self.trits.is_empty()
     }
 
+    /// Borrow the underlying trit slice.
     pub fn trits(&self) -> &[Trit] {
         &self.trits
     }
 
+    /// Get the trit at `idx`, or `None` if out of bounds.
     pub fn get(&self, idx: usize) -> Option<Trit> {
         self.trits.get(idx).copied()
     }
 
+    /// Set the trit at `idx`.
+    ///
+    /// If `idx` is out of bounds this is a silent no-op; check bounds with
+    /// [`TernarySeq::get`] beforehand if that matters to you.
     pub fn set(&mut self, idx: usize, trit: Trit) {
         if idx < self.trits.len() {
             self.trits[idx] = trit;
         }
     }
 
+    /// Append a trit to the end of the sequence.
     pub fn push(&mut self, trit: Trit) {
         self.trits.push(trit);
     }
 
+    /// Insert a trit at `idx`, shifting later elements right.
     pub fn insert(&mut self, idx: usize, trit: Trit) {
         self.trits.insert(idx, trit);
     }
 
+    /// Remove and return the trit at `idx`, or `None` if out of bounds.
     pub fn remove(&mut self, idx: usize) -> Option<Trit> {
         if idx < self.trits.len() {
             Some(self.trits.remove(idx))
@@ -91,38 +163,80 @@ impl TernarySeq {
         }
     }
 
-    /// Slice of the sequence
+    /// Return a copy of the sub-sequence `trits[start..end]`.
+    ///
+    /// Both bounds are clamped to the sequence length and `start` is clamped to
+    /// `end`, so this never panics: an empty or inverted range yields an empty
+    /// sequence.
     pub fn slice(&self, start: usize, end: usize) -> TernarySeq {
-        TernarySeq::new(self.trits[start..end.min(self.trits.len())].to_vec())
+        let len = self.trits.len();
+        let end = end.min(len);
+        let start = start.min(end);
+        TernarySeq::new(self.trits[start..end].to_vec())
     }
 }
 
-/// A single diff operation
+/// A single operation within a diff.
+///
+/// Positions are reported relative to the relevant sequence: for [`DiffOp::Equal`],
+/// [`DiffOp::Change`], and [`DiffOp::Delete`] the `pos` is an index into the
+/// *original* (old) sequence; for [`DiffOp::Insert`] it is an index into the
+/// *new* (target) sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiffOp {
-    /// No change at position
-    Equal { pos: usize, trit: Trit },
-    /// Value changed at position
-    Change { pos: usize, old: Trit, new: Trit },
-    /// Value inserted at position
-    Insert { pos: usize, trit: Trit },
-    /// Value removed at position
-    Delete { pos: usize, trit: Trit },
+    /// An element present (and unchanged) in both sequences.
+    Equal {
+        /// Index of the element in the original sequence.
+        pos: usize,
+        /// The unchanged value.
+        trit: Trit,
+    },
+    /// An element whose value was replaced.
+    Change {
+        /// Index of the replaced element in the original sequence.
+        pos: usize,
+        /// The original value.
+        old: Trit,
+        /// The replacement value.
+        new: Trit,
+    },
+    /// A new element added to the sequence.
+    Insert {
+        /// Index of the inserted element in the new sequence.
+        pos: usize,
+        /// The inserted value.
+        trit: Trit,
+    },
+    /// An element removed from the sequence.
+    Delete {
+        /// Index of the removed element in the original sequence.
+        pos: usize,
+        /// The removed value.
+        trit: Trit,
+    },
 }
 
-/// Result of a diff operation
+/// The result of diffing two sequences: an ordered list of [`DiffOp`]s.
 #[derive(Debug, Clone)]
 pub struct TernaryDiff {
     ops: Vec<DiffOp>,
 }
 
 impl TernaryDiff {
-    /// Compute diff between two sequences using LCS-based algorithm
+    /// Compute the diff between `old` and `new` using the classic LCS
+    /// (Longest Common Subsequence) dynamic-programming algorithm.
+    ///
+    /// The LCS table is backtracked to produce `Equal` / `Insert` / `Delete`
+    /// operations, then a normalization pass pairs adjacent `Delete` + `Insert`
+    /// runs into `Change` operations when they represent value replacements at
+    /// aligned positions. Any leftover inserts/deletes are kept as structural
+    /// additions/removals.
     pub fn diff(old: &TernarySeq, new: &TernarySeq) -> Self {
         let m = old.len();
         let n = new.len();
 
-        // Build LCS table
+        // Build the LCS length table. dp[i][j] = LCS length of old[..i] and
+        // new[..j].
         let mut dp = vec![vec![0usize; n + 1]; m + 1];
         for i in 1..=m {
             for j in 1..=n {
@@ -134,7 +248,7 @@ impl TernaryDiff {
             }
         }
 
-        // Backtrack to find diff
+        // Backtrack from (m, n) to (0, 0) recovering the edit script.
         let mut ops = Vec::new();
         let mut i = m;
         let mut j = n;
@@ -164,168 +278,225 @@ impl TernaryDiff {
 
         ops.reverse();
 
-        // Convert to changes where appropriate
-        let normalized = Self::normalize_ops(&ops, old, new);
+        // Pair adjacent delete/insert runs into changes where appropriate.
+        let normalized = Self::normalize_ops(&ops);
         TernaryDiff { ops: normalized }
     }
 
-    fn normalize_ops(ops: &[DiffOp], old: &TernarySeq, _new: &TernarySeq) -> Vec<DiffOp> {
+    fn normalize_ops(ops: &[DiffOp]) -> Vec<DiffOp> {
         let mut result = Vec::new();
         let mut deletes: Vec<(usize, Trit)> = Vec::new();
         let mut inserts: Vec<(usize, Trit)> = Vec::new();
+
+        let flush = |deletes: &mut Vec<(usize, Trit)>,
+                     inserts: &mut Vec<(usize, Trit)>,
+                     result: &mut Vec<DiffOp>| {
+            // Pair as many deletes with inserts as possible into Change ops.
+            let pairs = deletes.len().min(inserts.len());
+            for k in 0..pairs {
+                let (d_pos, d_trit) = deletes[k];
+                let (_, i_trit) = inserts[k];
+                result.push(DiffOp::Change {
+                    pos: d_pos,
+                    old: d_trit,
+                    new: i_trit,
+                });
+            }
+            for &(pos, trit) in deletes.iter().skip(pairs) {
+                result.push(DiffOp::Delete { pos, trit });
+            }
+            for &(pos, trit) in inserts.iter().skip(pairs) {
+                result.push(DiffOp::Insert { pos, trit });
+            }
+            deletes.clear();
+            inserts.clear();
+        };
 
         for op in ops {
             match op {
                 DiffOp::Delete { pos, trit } => deletes.push((*pos, *trit)),
                 DiffOp::Insert { pos, trit } => inserts.push((*pos, *trit)),
                 _ => {
-                    // Flush pending deletes and inserts as changes
-                    let pairs = deletes.len().min(inserts.len());
-                    for k in 0..pairs {
-                        let (d_pos, d_trit) = deletes[k];
-                        let (_, i_trit) = inserts[k];
-                        result.push(DiffOp::Change {
-                            pos: d_pos,
-                            old: d_trit,
-                            new: i_trit,
-                        });
-                    }
-                    for k in pairs..deletes.len() {
-                        let (pos, trit) = deletes[k];
-                        result.push(DiffOp::Delete { pos, trit });
-                    }
-                    for k in pairs..inserts.len() {
-                        let (pos, trit) = inserts[k];
-                        result.push(DiffOp::Insert { pos, trit });
-                    }
-                    deletes.clear();
-                    inserts.clear();
+                    flush(&mut deletes, &mut inserts, &mut result);
                     result.push(op.clone());
                 }
             }
         }
 
-        // Flush remaining
-        let pairs = deletes.len().min(inserts.len());
-        for k in 0..pairs {
-            let (d_pos, d_trit) = deletes[k];
-            let (_, i_trit) = inserts[k];
-            result.push(DiffOp::Change {
-                pos: d_pos,
-                old: d_trit,
-                new: i_trit,
-            });
-        }
-        for k in pairs..deletes.len() {
-            let (pos, trit) = deletes[k];
-            result.push(DiffOp::Delete { pos, trit });
-        }
-        for k in pairs..inserts.len() {
-            let (pos, trit) = inserts[k];
-            result.push(DiffOp::Insert { pos, trit });
-        }
+        // Flush any pending deletes/inserts at the end.
+        flush(&mut deletes, &mut inserts, &mut result);
 
         result
     }
 
+    /// Borrow the ordered list of diff operations.
     pub fn ops(&self) -> &[DiffOp] {
         &self.ops
     }
 
-    /// Count of changes
+    /// Count of operations that are *not* `Equal` (i.e. the number of actual
+    /// edits).
     pub fn change_count(&self) -> usize {
-        self.ops.iter().filter(|op| !matches!(op, DiffOp::Equal { .. })).count()
+        self.ops
+            .iter()
+            .filter(|op| !matches!(op, DiffOp::Equal { .. }))
+            .count()
     }
 
-    /// Calculate similarity (0.0 to 1.0)
+    /// A similarity ratio in `[0.0, 1.0]`: the fraction of operations that are
+    /// `Equal`. Two identical (including two empty) sequences score `1.0`.
     pub fn similarity(&self) -> f64 {
         if self.ops.is_empty() {
             return 1.0;
         }
-        let equal = self.ops.iter().filter(|op| matches!(op, DiffOp::Equal { .. })).count();
+        let equal = self
+            .ops
+            .iter()
+            .filter(|op| matches!(op, DiffOp::Equal { .. }))
+            .count();
         equal as f64 / self.ops.len() as f64
     }
 }
 
-/// Patch application
+/// Apply or reverse diffs against [`TernarySeq`] values.
 pub struct TernaryPatch;
 
 impl TernaryPatch {
-    /// Apply a diff to a sequence
+    /// Apply `diff` to `seq`, reconstructing the target sequence.
+    ///
+    /// The operations are walked in order alongside a cursor into `seq`:
+    /// `Equal`, `Change`, and `Delete` each consume exactly one element of
+    /// `seq`, while `Insert` emits a new element without advancing the cursor.
+    /// Because [`TernaryDiff::diff`] always produces a complete script that
+    /// covers every element of the source exactly once, this cursor-based
+    /// reconstruction reproduces the target exactly — and is immune to the
+    /// position-shift bugs that arithmetic-offset patching suffers from when
+    /// deletes and inserts interleave.
+    ///
+    /// In particular, `apply(a, &diff(a, b)) == b` for any two sequences.
     pub fn apply(seq: &TernarySeq, diff: &TernaryDiff) -> TernarySeq {
-        let mut result = seq.clone();
-        let mut offset = 0i64;
+        let mut result: Vec<Trit> = Vec::with_capacity(seq.len());
+        let mut oi = 0usize; // cursor into `seq`
 
         for op in &diff.ops {
             match op {
-                DiffOp::Equal { .. } => {}
-                DiffOp::Change { pos, new, .. } => {
-                    let adjusted = (*pos as i64 + offset) as usize;
-                    result.set(adjusted, *new);
-                }
-                DiffOp::Insert { pos, trit } => {
-                    let adjusted = (*pos as i64 + offset).min(result.len() as i64) as usize;
-                    if adjusted <= result.len() {
-                        result.trits.insert(adjusted, *trit);
-                        offset += 1;
+                DiffOp::Equal { trit, .. } => {
+                    // Retain the matched source element as-is.
+                    if oi < seq.trits.len() {
+                        result.push(seq.trits[oi]);
+                    } else {
+                        // Defensive: a malformed diff claiming more equal
+                        // elements than the source holds. Emit the recorded
+                        // value so the length contract still holds.
+                        result.push(*trit);
                     }
+                    oi += 1;
                 }
-                DiffOp::Delete { pos, .. } => {
-                    let adjusted = (*pos as i64 + offset) as usize;
-                    if adjusted < result.len() {
-                        result.trits.remove(adjusted);
-                        offset -= 1;
-                    }
+                DiffOp::Change { new, .. } => {
+                    // Replace the consumed source element with the new value.
+                    result.push(*new);
+                    oi += 1;
+                }
+                DiffOp::Delete { .. } => {
+                    // Drop the consumed source element.
+                    oi += 1;
+                }
+                DiffOp::Insert { trit, .. } => {
+                    // Emit a new element without advancing the source cursor.
+                    result.push(*trit);
                 }
             }
         }
-        result
+
+        TernarySeq::new(result)
     }
 
-    /// Reverse a diff
+    /// Produce the inverse of a diff: swap `Insert` ↔ `Delete` and swap
+    /// `old`/`new` in `Change` operations.
+    ///
+    /// Applying the reversed diff to the target recovers the original:
+    /// `apply(b, &reverse(diff(a, b))) == a`.
     pub fn reverse(diff: &TernaryDiff) -> TernaryDiff {
-        let reversed_ops = diff.ops.iter().map(|op| match op {
-            DiffOp::Equal { pos, trit } => DiffOp::Equal { pos: *pos, trit: *trit },
-            DiffOp::Change { pos, old, new } => DiffOp::Change { pos: *pos, old: *new, new: *old },
-            DiffOp::Insert { pos, trit } => DiffOp::Delete { pos: *pos, trit: *trit },
-            DiffOp::Delete { pos, trit } => DiffOp::Insert { pos: *pos, trit: *trit },
-        }).collect();
+        let reversed_ops = diff
+            .ops
+            .iter()
+            .map(|op| match op {
+                DiffOp::Equal { pos, trit } => DiffOp::Equal {
+                    pos: *pos,
+                    trit: *trit,
+                },
+                DiffOp::Change { pos, old, new } => DiffOp::Change {
+                    pos: *pos,
+                    old: *new,
+                    new: *old,
+                },
+                DiffOp::Insert { pos, trit } => DiffOp::Delete {
+                    pos: *pos,
+                    trit: *trit,
+                },
+                DiffOp::Delete { pos, trit } => DiffOp::Insert {
+                    pos: *pos,
+                    trit: *trit,
+                },
+            })
+            .collect();
         TernaryDiff { ops: reversed_ops }
     }
 }
 
-/// Merge conflict
+/// A conflict discovered during a three-way merge.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Conflict {
-    /// Both sides changed the same position differently
+    /// Both sides changed the same position to different values.
     ChangeConflict {
+        /// Position that conflicts.
         pos: usize,
+        /// The base (common-ancestor) value.
         base: Trit,
+        /// The left branch's value.
         left: Trit,
+        /// The right branch's value.
         right: Trit,
     },
-    /// One side deleted, other changed
+    /// One side deleted the element while the other changed it.
     DeleteChangeConflict {
+        /// Position that conflicts.
         pos: usize,
+        /// The value that was deleted.
         deleted: Trit,
+        /// The value the other side changed it to.
         changed_to: Trit,
+        /// `true` if the left branch was the one that *changed* (and right
+        /// deleted); `false` if right changed and left deleted.
         changer_left: bool,
     },
 }
 
-/// Three-way merge result
+/// The outcome of a [`ThreeWayMerge`]: the merged sequence plus any conflicts.
 #[derive(Debug, Clone)]
 pub struct MergeResult {
+    /// The merged sequence. At conflicting positions the left value is taken
+    /// by default, pending resolution.
     pub merged: TernarySeq,
+    /// Conflicts found during the merge, in position order.
     pub conflicts: Vec<Conflict>,
+    /// Convenience flag: `true` iff `conflicts` is non-empty.
     pub has_conflicts: bool,
 }
 
-/// Three-way merge
+/// Position-wise three-way merge of two sequences against a common base.
+///
+/// At each index the base, left, and right values are compared: if only one
+/// side changed it is taken; if both changed identically it is taken;
+/// otherwise it is a conflict. Note that this is *position-based* (see the
+/// crate-level docs and the "Known Limitations" in the README): it does not
+/// align sequences first, so an insertion on one side shifts every later
+/// position.
 pub struct ThreeWayMerge;
 
 impl ThreeWayMerge {
-    /// Merge two sequences against a common base
+    /// Merge `left` and `right` against their common `base`, returning the
+    /// merged sequence and any conflicts.
     pub fn merge(base: &TernarySeq, left: &TernarySeq, right: &TernarySeq) -> MergeResult {
         let max_len = base.len().max(left.len()).max(right.len());
         let mut merged = Vec::with_capacity(max_len);
@@ -337,23 +508,23 @@ impl ThreeWayMerge {
             let r = right.get(i);
 
             match (b, l, r) {
-                // All same
+                // All three identical.
                 (Some(bv), Some(lv), Some(rv)) if bv == lv && lv == rv => {
                     merged.push(bv);
                 }
-                // Only left changed
+                // Only the left branch changed.
                 (Some(bv), Some(lv), Some(rv)) if lv != bv && rv == bv => {
                     merged.push(lv);
                 }
-                // Only right changed
+                // Only the right branch changed.
                 (Some(bv), Some(lv), Some(rv)) if rv != bv && lv == bv => {
                     merged.push(rv);
                 }
-                // Both changed to same
+                // Both branches changed to the same value.
                 (Some(_bv), Some(lv), Some(rv)) if lv == rv => {
                     merged.push(lv);
                 }
-                // Both changed differently — conflict
+                // Both changed differently — conflict.
                 (Some(bv), Some(lv), Some(rv)) => {
                     conflicts.push(Conflict::ChangeConflict {
                         pos: i,
@@ -361,9 +532,9 @@ impl ThreeWayMerge {
                         left: lv,
                         right: rv,
                     });
-                    merged.push(lv); // Default: take left
+                    merged.push(lv); // Default: take left pending resolution.
                 }
-                // Base deleted, left and/or right changed
+                // Base absent (shorter) but both branches present here.
                 (None, Some(lv), Some(rv)) => {
                     if lv == rv {
                         merged.push(lv);
@@ -380,10 +551,9 @@ impl ThreeWayMerge {
                 (None, Some(lv), None) => merged.push(lv),
                 (None, None, Some(rv)) => merged.push(rv),
                 (None, None, None) => {}
-                // One side deleted
-                (Some(bv), None, Some(rv)) if rv == bv => {
-                    // Left deleted, right unchanged — delete
-                }
+                // Left deleted, right unchanged — delete.
+                (Some(bv), None, Some(rv)) if rv == bv => {}
+                // Left deleted, right changed — conflict.
                 (Some(bv), None, Some(rv)) => {
                     conflicts.push(Conflict::DeleteChangeConflict {
                         pos: i,
@@ -392,9 +562,9 @@ impl ThreeWayMerge {
                         changer_left: false,
                     });
                 }
-                (Some(bv), Some(lv), None) if lv == bv => {
-                    // Right deleted, left unchanged — delete
-                }
+                // Right deleted, left unchanged — delete.
+                (Some(bv), Some(lv), None) if lv == bv => {}
+                // Right deleted, left changed — conflict.
                 (Some(bv), Some(lv), None) => {
                     conflicts.push(Conflict::DeleteChangeConflict {
                         pos: i,
@@ -403,9 +573,8 @@ impl ThreeWayMerge {
                         changer_left: true,
                     });
                 }
-                (Some(_bv), None, None) => {
-                    // Both deleted — ok
-                }
+                // Both deleted — agree, nothing to emit.
+                (Some(_bv), None, None) => {}
             }
         }
 
@@ -417,31 +586,38 @@ impl ThreeWayMerge {
     }
 }
 
-/// Conflict resolution strategies
+/// Strategy for resolving merge conflicts.
 #[derive(Debug, Clone, Copy)]
 pub enum ResolutionStrategy {
-    /// Take the left side
+    /// Take the left branch's value.
     TakeLeft,
-    /// Take the right side
+    /// Take the right branch's value.
     TakeRight,
-    /// Take the base value
+    /// Take the base (common-ancestor) value.
     TakeBase,
-    /// Use Trit::Zero (neutral)
+    /// Force the neutral value (`Trit::Zero`).
     Neutral,
-    /// Take the max value
+    /// Take the higher ternary value (`to_i8` maximum).
     Max,
-    /// Take the min value
+    /// Take the lower ternary value (`to_i8` minimum).
     Min,
 }
 
+/// Resolve every conflict in a [`MergeResult`] according to a single strategy.
 pub struct ConflictResolver;
 
 impl ConflictResolver {
-    /// Resolve conflicts using a given strategy
+    /// Resolve all conflicts in `result` using `strategy`, clearing the
+    /// conflict list afterwards.
     pub fn resolve(result: &mut MergeResult, strategy: ResolutionStrategy) {
         for conflict in &result.conflicts {
             match conflict {
-                Conflict::ChangeConflict { pos, base, left, right } => {
+                Conflict::ChangeConflict {
+                    pos,
+                    base,
+                    left,
+                    right,
+                } => {
                     let resolved = match strategy {
                         ResolutionStrategy::TakeLeft => *left,
                         ResolutionStrategy::TakeRight => *right,
@@ -460,13 +636,26 @@ impl ConflictResolver {
                         result.merged.set(*pos, resolved);
                     }
                 }
-                Conflict::DeleteChangeConflict { pos, changed_to, changer_left, .. } => {
+                Conflict::DeleteChangeConflict {
+                    pos,
+                    changed_to,
+                    changer_left,
+                    ..
+                } => {
                     let resolved = match strategy {
                         ResolutionStrategy::TakeLeft => {
-                            if *changer_left { *changed_to } else { Trit::Zero }
+                            if *changer_left {
+                                *changed_to
+                            } else {
+                                Trit::Zero
+                            }
                         }
                         ResolutionStrategy::TakeRight => {
-                            if !changer_left { *changed_to } else { Trit::Zero }
+                            if !*changer_left {
+                                *changed_to
+                            } else {
+                                Trit::Zero
+                            }
                         }
                         ResolutionStrategy::TakeBase => Trit::Zero,
                         ResolutionStrategy::Neutral => Trit::Zero,
@@ -494,6 +683,8 @@ impl ConflictResolver {
 mod tests {
     use super::*;
 
+    // --- Trit ---
+
     #[test]
     fn test_trit_basic() {
         assert_eq!(Trit::Neg.to_i8(), -1);
@@ -502,11 +693,26 @@ mod tests {
     }
 
     #[test]
+    fn test_trit_roundtrip() {
+        for v in [-1, 0, 1] {
+            assert_eq!(Trit::from_i8(v).unwrap().to_i8(), v);
+        }
+        assert_eq!(Trit::from_i8(2), None);
+        assert_eq!(Trit::from_i8(-2), None);
+        assert_eq!(Trit::from_i8(127), None);
+    }
+
+    // --- TernarySeq ---
+
+    #[test]
     fn test_seq_basic() {
         let seq = TernarySeq::from_i8(&[-1, 0, 1]);
         assert_eq!(seq.len(), 3);
         assert_eq!(seq.get(0), Some(Trit::Neg));
         assert_eq!(seq.get(2), Some(Trit::Pos));
+        assert_eq!(seq.get(3), None);
+        assert!(!seq.is_empty());
+        assert!(TernarySeq::new(vec![]).is_empty());
     }
 
     #[test]
@@ -515,6 +721,7 @@ mod tests {
         seq.push(Trit::Pos);
         seq.push(Trit::Neg);
         assert_eq!(seq.len(), 2);
+        assert_eq!(seq.trits(), &[Trit::Pos, Trit::Neg]);
     }
 
     #[test]
@@ -523,8 +730,9 @@ mod tests {
         seq.insert(1, Trit::Pos);
         assert_eq!(seq.len(), 4);
         assert_eq!(seq.get(1), Some(Trit::Pos));
-        seq.remove(1);
+        assert_eq!(seq.remove(1), Some(Trit::Pos));
         assert_eq!(seq.len(), 3);
+        assert_eq!(seq.remove(99), None);
     }
 
     #[test]
@@ -536,12 +744,49 @@ mod tests {
     }
 
     #[test]
+    fn test_seq_slice_out_of_range_never_panics() {
+        // All of these must not panic; bounds are clamped.
+        let seq = TernarySeq::from_i8(&[-1, 0, 1]);
+        assert_eq!(seq.slice(0, 99).len(), 3); // end clamped to len
+        assert_eq!(seq.slice(99, 99).len(), 0); // start clamped to end
+        assert_eq!(seq.slice(99, 1).len(), 0); // start > end -> empty
+        assert_eq!(seq.slice(1, 1).len(), 0); // empty range
+        assert_eq!(seq.slice(2, 5).trits(), &[Trit::Pos]);
+    }
+
+    #[test]
+    fn test_seq_set_out_of_bounds_is_noop() {
+        let mut seq = TernarySeq::from_i8(&[0, 0]);
+        seq.set(5, Trit::Pos); // out of bounds: silent no-op
+        assert_eq!(seq.trits(), &[Trit::Zero, Trit::Zero]);
+        seq.set(0, Trit::Pos);
+        assert_eq!(seq.get(0), Some(Trit::Pos));
+    }
+
+    #[test]
+    fn test_from_i8_silent_drop_vs_strict() {
+        // from_i8 silently drops invalid values (documented behavior).
+        let dropped = TernarySeq::from_i8(&[1, 2, 3]);
+        assert_eq!(dropped.trits(), &[Trit::Pos]);
+        // from_i8_strict surfaces the first invalid value.
+        assert_eq!(TernarySeq::from_i8_strict(&[1, 2, 3]), Err(2));
+        assert!(TernarySeq::from_i8_strict(&[-1, 0, 1]).is_ok());
+        assert!(TernarySeq::from_i8_strict(&[]).unwrap().is_empty());
+    }
+
+    // --- Diff ---
+
+    #[test]
     fn test_diff_equal() {
         let a = TernarySeq::from_i8(&[1, -1, 0]);
         let b = TernarySeq::from_i8(&[1, -1, 0]);
         let diff = TernaryDiff::diff(&a, &b);
         assert_eq!(diff.change_count(), 0);
         assert_eq!(diff.ops().len(), 3);
+        assert!(diff
+            .ops()
+            .iter()
+            .all(|op| matches!(op, DiffOp::Equal { .. })));
     }
 
     #[test]
@@ -549,7 +794,26 @@ mod tests {
         let a = TernarySeq::from_i8(&[1, -1, 0]);
         let b = TernarySeq::from_i8(&[1, 0, 0]);
         let diff = TernaryDiff::diff(&a, &b);
-        assert!(diff.change_count() > 0);
+        // Exactly one position changes value (-1 -> 0).
+        assert_eq!(diff.change_count(), 1);
+        assert_eq!(
+            diff.ops(),
+            &[
+                DiffOp::Equal {
+                    pos: 0,
+                    trit: Trit::Pos
+                },
+                DiffOp::Change {
+                    pos: 1,
+                    old: Trit::Neg,
+                    new: Trit::Zero
+                },
+                DiffOp::Equal {
+                    pos: 2,
+                    trit: Trit::Zero
+                },
+            ]
+        );
     }
 
     #[test]
@@ -557,7 +821,17 @@ mod tests {
         let a = TernarySeq::from_i8(&[1, 0]);
         let b = TernarySeq::from_i8(&[1, -1, 0]);
         let diff = TernaryDiff::diff(&a, &b);
-        assert!(diff.ops().iter().any(|op| matches!(op, DiffOp::Insert { .. })));
+        // Exactly one insertion.
+        assert_eq!(
+            diff.ops()
+                .iter()
+                .filter(|o| matches!(o, DiffOp::Insert { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(diff.change_count(), 1);
+        // Round-trips.
+        assert_eq!(TernaryPatch::apply(&a, &diff).trits(), b.trits());
     }
 
     #[test]
@@ -565,42 +839,166 @@ mod tests {
         let a = TernarySeq::from_i8(&[1, -1, 0]);
         let b = TernarySeq::from_i8(&[1, 0]);
         let diff = TernaryDiff::diff(&a, &b);
-        assert!(diff.ops().iter().any(|op| matches!(op, DiffOp::Delete { .. })));
+        // Exactly one deletion.
+        assert_eq!(
+            diff.ops()
+                .iter()
+                .filter(|o| matches!(o, DiffOp::Delete { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(diff.change_count(), 1);
+        assert_eq!(TernaryPatch::apply(&a, &diff).trits(), b.trits());
+    }
+
+    #[test]
+    fn test_diff_empty() {
+        let a = TernarySeq::new(vec![]);
+        let b = TernarySeq::new(vec![]);
+        let diff = TernaryDiff::diff(&a, &b);
+        assert_eq!(diff.ops().len(), 0);
+        assert_eq!(diff.change_count(), 0);
+        assert_eq!(diff.similarity(), 1.0);
+        assert_eq!(TernaryPatch::apply(&a, &diff).trits(), b.trits());
+    }
+
+    #[test]
+    fn test_diff_insert_all() {
+        let a = TernarySeq::new(vec![]);
+        let b = TernarySeq::from_i8(&[1, -1, 0]);
+        let diff = TernaryDiff::diff(&a, &b);
+        assert_eq!(diff.change_count(), 3);
+        assert!(diff
+            .ops()
+            .iter()
+            .all(|op| matches!(op, DiffOp::Insert { .. })));
+        assert_eq!(TernaryPatch::apply(&a, &diff).trits(), b.trits());
+    }
+
+    #[test]
+    fn test_diff_delete_all() {
+        let a = TernarySeq::from_i8(&[1, -1, 0]);
+        let b = TernarySeq::new(vec![]);
+        let diff = TernaryDiff::diff(&a, &b);
+        assert_eq!(diff.change_count(), 3);
+        assert!(diff
+            .ops()
+            .iter()
+            .all(|op| matches!(op, DiffOp::Delete { .. })));
+        assert_eq!(TernaryPatch::apply(&a, &diff).trits(), b.trits());
+    }
+
+    #[test]
+    fn test_diff_disjoint() {
+        // Completely disjoint: no common element, LCS length 0.
+        let a = TernarySeq::from_i8(&[1, 1, 1]);
+        let b = TernarySeq::from_i8(&[-1, -1, -1]);
+        let diff = TernaryDiff::diff(&a, &b);
+        assert_eq!(diff.similarity(), 0.0);
+        assert_eq!(diff.change_count(), 3);
+        assert_eq!(TernaryPatch::apply(&a, &diff).trits(), b.trits());
+    }
+
+    #[test]
+    fn test_diff_single_element() {
+        // Single element, changed.
+        let a = TernarySeq::from_i8(&[0]);
+        let b = TernarySeq::from_i8(&[1]);
+        let diff = TernaryDiff::diff(&a, &b);
+        assert_eq!(diff.ops().len(), 1);
+        assert_eq!(diff.change_count(), 1);
+        assert_eq!(TernaryPatch::apply(&a, &diff).trits(), b.trits());
+        // Single element, identical.
+        let d2 = TernaryDiff::diff(&a, &a);
+        assert_eq!(d2.change_count(), 0);
+    }
+
+    // --- Patch round-trip (the core invariant) ---
+
+    /// Property-style helper: diff then patch must reconstruct b exactly, and
+    /// the reversed diff applied to b must reconstruct a exactly.
+    fn assert_roundtrip(a: &TernarySeq, b: &TernarySeq) {
+        let diff = TernaryDiff::diff(a, b);
+        let patched = TernaryPatch::apply(a, &diff);
+        assert_eq!(patched.trits(), b.trits(), "forward round-trip failed");
+
+        let reversed = TernaryPatch::reverse(&diff);
+        let restored = TernaryPatch::apply(b, &reversed);
+        assert_eq!(restored.trits(), a.trits(), "reverse round-trip failed");
     }
 
     #[test]
     fn test_patch_apply() {
         let a = TernarySeq::from_i8(&[1, -1, 0]);
         let b = TernarySeq::from_i8(&[1, 0, 0]);
-        let diff = TernaryDiff::diff(&a, &b);
-        let patched = TernaryPatch::apply(&a, &diff);
-        assert_eq!(patched.trits(), b.trits());
+        assert_roundtrip(&a, &b);
     }
 
     #[test]
     fn test_patch_reverse() {
         let a = TernarySeq::from_i8(&[1, -1, 0]);
         let b = TernarySeq::from_i8(&[1, 0, 0]);
-        let diff = TernaryDiff::diff(&a, &b);
-        let reversed = TernaryPatch::reverse(&diff);
-        let restored = TernaryPatch::apply(&b, &reversed);
-        assert_eq!(restored.trits(), a.trits());
+        assert_roundtrip(&a, &b);
     }
+
+    /// The exact scenario from the README Quick Start. Previously this FAILED:
+    /// the offset-based apply produced [1,0,-1,0] instead of [1,0,0,-1] because
+    /// a Change (built from a delete at old index 3) and a leftover Insert
+    /// (new index 3) desynced the offset bookkeeping.
+    #[test]
+    fn test_patch_roundtrip_readme_example() {
+        let a = TernarySeq::from_i8(&[1, -1, 0, 1]);
+        let b = TernarySeq::from_i8(&[1, 0, 0, -1]);
+        assert_roundtrip(&a, &b);
+        // Sanity: the diff really is non-trivial (mixes a change and an insert).
+        let diff = TernaryDiff::diff(&a, &b);
+        assert!(diff.change_count() >= 2);
+    }
+
+    #[test]
+    fn test_patch_roundtrip_many_cases() {
+        // A spread of shapes that stress the patch cursor: inserts, deletes,
+        // changes, mismatched lengths, empty ends, and interleaving.
+        let cases: &[(&[i8], &[i8])] = &[
+            (&[1, -1, 0, 1], &[1, 0, 0, -1]),           // README example
+            (&[1, 1, 1], &[-1, -1, -1]),                // disjoint
+            (&[1, 0], &[1, -1, 0]),                     // pure insert
+            (&[1, -1, 0], &[1, 0]),                     // pure delete
+            (&[], &[1, -1, 0]),                         // all insert
+            (&[1, -1, 0], &[]),                         // all delete
+            (&[1, 0, 1, 0], &[1, 1]),                   // mismatched lengths
+            (&[0], &[1]),                               // single change
+            (&[0], &[0]),                               // single equal
+            (&[], &[]),                                 // both empty
+            (&[1, -1, 1, -1, 1], &[1, 0, 0, -1, 0, 1]), // mixed, lengthen
+            (&[1, 0, 1, 0, 1, -1], &[0, 1, -1]),        // mixed, shorten
+        ];
+        for (a, b) in cases {
+            let sa = TernarySeq::from_i8(a);
+            let sb = TernarySeq::from_i8(b);
+            assert_roundtrip(&sa, &sb);
+        }
+    }
+
+    // --- Similarity ---
 
     #[test]
     fn test_similarity_identical() {
         let a = TernarySeq::from_i8(&[1, -1, 0]);
         let diff = TernaryDiff::diff(&a, &a);
-        assert!((diff.similarity() - 1.0).abs() < 0.01);
+        assert_eq!(diff.similarity(), 1.0);
     }
 
     #[test]
     fn test_similarity_different() {
+        // Fully disjoint: similarity is exactly 0.0, not merely "< 0.5".
         let a = TernarySeq::from_i8(&[1, 1, 1]);
         let b = TernarySeq::from_i8(&[-1, -1, -1]);
         let diff = TernaryDiff::diff(&a, &b);
-        assert!(diff.similarity() < 0.5);
+        assert_eq!(diff.similarity(), 0.0);
     }
+
+    // --- Three-way merge ---
 
     #[test]
     fn test_three_way_merge_no_conflict() {
@@ -620,7 +1018,24 @@ mod tests {
         let right = TernarySeq::from_i8(&[-1, 0, 0]);
         let result = ThreeWayMerge::merge(&base, &left, &right);
         assert!(result.has_conflicts);
+        assert_eq!(result.conflicts.len(), 1);
     }
+
+    #[test]
+    fn test_three_way_merge_delete_change_conflict() {
+        // Base has 3 elements; left deletes index 0, right changes index 0.
+        let base = TernarySeq::from_i8(&[0, 0, 0]);
+        let left = TernarySeq::from_i8(&[0, 0]); // shorter -> "deleted" index 2
+        let right = TernarySeq::from_i8(&[0, 0, 1]); // changed index 2
+        let result = ThreeWayMerge::merge(&base, &left, &right);
+        assert!(result.has_conflicts);
+        assert!(result
+            .conflicts
+            .iter()
+            .any(|c| matches!(c, Conflict::DeleteChangeConflict { .. })));
+    }
+
+    // --- Conflict resolution ---
 
     #[test]
     fn test_conflict_resolver_left() {
@@ -655,18 +1070,17 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_empty() {
-        let a = TernarySeq::new(vec![]);
-        let b = TernarySeq::new(vec![]);
-        let diff = TernaryDiff::diff(&a, &b);
-        assert_eq!(diff.ops().len(), 0);
-    }
+    fn test_conflict_resolver_max_min() {
+        let base = TernarySeq::from_i8(&[0, 0]);
+        let left = TernarySeq::from_i8(&[1, -1]);
+        let right = TernarySeq::from_i8(&[-1, 1]);
+        // Both positions conflict: {+1,-1} and {-1,+1}.
+        let mut mx = ThreeWayMerge::merge(&base, &left, &right);
+        ConflictResolver::resolve(&mut mx, ResolutionStrategy::Max);
+        assert_eq!(mx.merged.trits(), &[Trit::Pos, Trit::Pos]);
 
-    #[test]
-    fn test_diff_insert_all() {
-        let a = TernarySeq::new(vec![]);
-        let b = TernarySeq::from_i8(&[1, -1, 0]);
-        let diff = TernaryDiff::diff(&a, &b);
-        assert_eq!(diff.change_count(), 3);
+        let mut mn = ThreeWayMerge::merge(&base, &left, &right);
+        ConflictResolver::resolve(&mut mn, ResolutionStrategy::Min);
+        assert_eq!(mn.merged.trits(), &[Trit::Neg, Trit::Neg]);
     }
 }
